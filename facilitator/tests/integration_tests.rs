@@ -311,9 +311,8 @@ fn aggregation_including_invalid_batch() {
     .unwrap()
     .generate_sum_part(&batch_uuids_and_dates, || {})
     .unwrap_err();
-    // Ideally we would be able to match on a variant in an error enum to check
-    // what the failure was but for now check the error description
-    assert!(err.to_string().contains("packet file digest in header"));
+
+    assert!(matches!(err, Error::BadPeerValidationBatch(_)));
 
     let err = BatchAggregator::new(
         instance_name,
@@ -329,9 +328,8 @@ fn aggregation_including_invalid_batch() {
     .unwrap()
     .generate_sum_part(&batch_uuids_and_dates, || {})
     .unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("key identifier default-facilitator-signing-key not present in key map"));
+
+    assert!(matches!(err, Error::BadPeerValidationBatch(_)));
 }
 
 fn end_to_end_test(drop_nth_pha: Option<usize>, drop_nth_facilitator: Option<usize>) {
@@ -686,7 +684,7 @@ fn check_invalid_packets(
         loop {
             match InvalidPacket::read(&mut invalid_packet_reader) {
                 Ok(packet) => assert!(dropped_packets.contains(&packet.uuid)),
-                Err(Error::EofError) => break,
+                Err(Error::Eof) => break,
                 Err(err) => assert!(false, "error reading invalid packet {}", err),
             }
         }

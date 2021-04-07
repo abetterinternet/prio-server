@@ -2,7 +2,6 @@ use crate::config::StoragePath;
 use crate::http;
 use anyhow::{anyhow, Context, Result};
 use elliptic_curve::sec1::{EncodedPoint, ToEncodedPoint};
-use log::debug;
 use p256::pkcs8::FromPublicKey;
 use p256::NistP256;
 use pkix::pem::{pem_to_der, PEM_CERTIFICATE_REQUEST};
@@ -52,7 +51,6 @@ impl PacketEncryptionCertificateSigningRequest {
 
     /// Gets the base64ed public key from the CSR that libprio-rs is expecting
     pub fn base64_public_key(&self) -> Result<String> {
-        debug!("Packet Encryption Certificate Signing Request: {:?}", self);
         let der = pem_to_der(
             &self.certificate_signing_request,
             Some(PEM_CERTIFICATE_REQUEST),

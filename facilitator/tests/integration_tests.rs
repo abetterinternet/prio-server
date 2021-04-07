@@ -4,12 +4,13 @@ use facilitator::{
     batch::{Batch, BatchReader},
     idl::{InvalidPacket, Packet, SumPart},
     intake::BatchIntaker,
+    logging::setup_test_logging,
     sample::{SampleGenerator, SampleOutput},
     test_utils::{
         default_facilitator_packet_encryption_public_key, default_facilitator_signing_private_key,
         default_facilitator_signing_public_key, default_ingestor_private_key,
         default_ingestor_public_key, default_pha_packet_encryption_public_key,
-        default_pha_signing_private_key, default_pha_signing_public_key, log_init,
+        default_pha_signing_private_key, default_pha_signing_public_key,
         DEFAULT_FACILITATOR_ECIES_PRIVATE_KEY, DEFAULT_PHA_ECIES_PRIVATE_KEY,
     },
     transport::{
@@ -19,6 +20,7 @@ use facilitator::{
     Error,
 };
 use prio::{encrypt::PrivateKey, util::reconstruct_shares};
+use slog::info;
 use std::collections::{HashMap, HashSet};
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -40,7 +42,7 @@ fn inconsistent_ingestion_batches() {
 /// an invalid packet file digest.
 #[test]
 fn aggregation_including_invalid_batch() {
-    log_init();
+    let logger = setup_test_logging();
 
     let pha_tempdir = TempDir::new().unwrap();
     let facilitator_tempdir = TempDir::new().unwrap();
@@ -103,11 +105,12 @@ fn aggregation_including_invalid_batch() {
         100,
         &mut pha_output,
         &mut facilitator_output,
+        &logger,
     );
 
     for (batch_uuid, date) in &batch_uuids_and_dates {
         let reference_sum = sample_generator
-            .generate_ingestion_sample(batch_uuid, date, 100)
+            .generate_ingestion_sample("trace-id", batch_uuid, date, 100)
             .unwrap();
 
         reference_sums.push(reference_sum);
@@ -197,7 +200,7 @@ fn aggregation_including_invalid_batch() {
     // tampering with signatures or batch headers as needed.
     for (index, (uuid, _)) in batch_uuids_and_dates.iter().enumerate() {
         let pha_peer_validation_transport = if index == 2 {
-            log::info!("pha using wrong key for peer validations");
+            info!(logger, "pha using wrong key for peer validations");
             &mut pha_to_facilitator_validation_transport_wrong_key
         } else {
             &mut pha_to_facilitator_validation_transport_valid_key
@@ -213,6 +216,7 @@ fn aggregation_including_invalid_batch() {
             pha_peer_validation_transport,
             true,  // is_first
             false, // permissive
+            &logger,
         )
         .unwrap();
 
@@ -226,6 +230,7 @@ fn aggregation_including_invalid_batch() {
             &mut facilitator_to_pha_validation_transport,
             false, // is_first
             false, // permissive
+            &logger,
         )
         .unwrap();
 
@@ -313,6 +318,7 @@ fn aggregation_including_invalid_batch() {
         &mut pha_own_validation_transport,
         &mut pha_peer_validation_transport,
         &mut pha_aggregation_transport,
+        &logger,
     )
     .unwrap()
     .generate_sum_part(&batch_uuids_and_dates, || {})
@@ -333,6 +339,7 @@ fn aggregation_including_invalid_batch() {
         &mut facilitator_own_validation_transport,
         &mut facilitator_peer_validation_transport,
         &mut facilitator_aggregation_transport,
+        &logger,
     )
     .unwrap()
     .generate_sum_part(&batch_uuids_and_dates, || {})
@@ -343,7 +350,7 @@ fn aggregation_including_invalid_batch() {
 }
 
 fn end_to_end_test(drop_nth_pha: Option<usize>, drop_nth_facilitator: Option<usize>) {
-    log_init();
+    let logger = setup_test_logging();
     let pha_tempdir = TempDir::new().unwrap();
     let pha_copy_tempdir = TempDir::new().unwrap();
     let facilitator_tempdir = TempDir::new().unwrap();
@@ -395,14 +402,15 @@ fn end_to_end_test(drop_nth_pha: Option<usize>, drop_nth_facilitator: Option<usi
         100,
         &mut pha_output,
         &mut facilitator_output,
+        &logger,
     );
 
     let batch_1_reference_sum = sample_generator
-        .generate_ingestion_sample(&batch_1_uuid, &date, first_batch_packet_count)
+        .generate_ingestion_sample("trace-id", &batch_1_uuid, &date, first_batch_packet_count)
         .unwrap();
 
     let batch_2_reference_sum = sample_generator
-        .generate_ingestion_sample(&batch_2_uuid, &date, 14)
+        .generate_ingestion_sample("trace-id", &batch_2_uuid, &date, 14)
         .unwrap();
 
     let mut ingestor_pub_keys = HashMap::new();
@@ -471,6 +479,7 @@ fn end_to_end_test(drop_nth_pha: Option<usize>, drop_nth_facilitator: Option<usi
         &mut pha_own_validate_signable_transport,
         true,
         false,
+        &logger,
     )
     .unwrap();
     batch_intaker.set_callback_cadence(2);
@@ -493,6 +502,7 @@ fn end_to_end_test(drop_nth_pha: Option<usize>, drop_nth_facilitator: Option<usi
         &mut pha_own_validate_signable_transport,
         true,
         false,
+        &logger,
     )
     .unwrap()
     .generate_validation_share(|| {})
@@ -508,6 +518,7 @@ fn end_to_end_test(drop_nth_pha: Option<usize>, drop_nth_facilitator: Option<usi
         &mut facilitator_own_validate_signable_transport,
         false,
         false,
+        &logger,
     )
     .unwrap()
     .generate_validation_share(|| {})
@@ -523,6 +534,7 @@ fn end_to_end_test(drop_nth_pha: Option<usize>, drop_nth_facilitator: Option<usi
         &mut facilitator_own_validate_signable_transport,
         false,
         false,
+        &logger,
     )
     .unwrap()
     .generate_validation_share(|| {})
@@ -571,6 +583,7 @@ fn end_to_end_test(drop_nth_pha: Option<usize>, drop_nth_facilitator: Option<usi
         &mut pha_validate_verifiable_transport,
         &mut facilitator_validate_verifiable_transport,
         &mut pha_aggregation_transport,
+        &logger,
     )
     .unwrap()
     .generate_sum_part(&batch_ids_and_dates, || aggregation_callback_count += 1)
@@ -598,6 +611,7 @@ fn end_to_end_test(drop_nth_pha: Option<usize>, drop_nth_facilitator: Option<usi
         &mut facilitator_validate_verifiable_transport,
         &mut pha_validate_verifiable_transport,
         &mut facilitator_aggregation_transport,
+        &logger,
     )
     .unwrap()
     .generate_sum_part(&batch_ids_and_dates, || aggregation_callback_count += 1)
@@ -616,6 +630,8 @@ fn end_to_end_test(drop_nth_pha: Option<usize>, drop_nth_facilitator: Option<usi
             ),
             &mut *pha_aggregation_transport.transport,
             false,
+            "trace-id",
+            &logger,
         );
     let pha_sum_part = pha_aggregation_batch_reader.header(&pha_pub_keys).unwrap();
     assert_eq!(
@@ -635,6 +651,8 @@ fn end_to_end_test(drop_nth_pha: Option<usize>, drop_nth_facilitator: Option<usi
             ),
             &mut *facilitator_aggregation_transport.transport,
             false, // permissive
+            "trace-id",
+            &logger,
         );
 
     let facilitator_sum_part = facilitator_aggregation_batch_reader

@@ -2,11 +2,12 @@ use crate::{
     config::Identity,
     gcp_oauth::GcpOauthTokenProvider,
     http::{prepare_request, send_json_request, Method, RequestParameters},
+    logging::{IDENTITY_EVENT_KEY, TASK_ACKNOWLEDGEMENT_ID_EVENT_KEY, TASK_QUEUE_ID_EVENT_KEY},
     task::{Task, TaskHandle, TaskQueue},
 };
 use anyhow::{anyhow, Context, Result};
-use log::info;
 use serde::Deserialize;
+use slog::{info, o, Logger};
 use std::{io::Cursor, marker::PhantomData, time::Duration};
 use ureq::{Agent, AgentBuilder};
 use url::Url;
@@ -24,7 +25,7 @@ fn gcp_pubsub_pull_url(
         pubsub_api_endpoint, gcp_project_id, subscription_id
     );
     Url::parse(&request_url).context(format!(
-        "faield to parse gcp_pubsub_pull_url: {}",
+        "failed to parse gcp_pubsub_pull_url: {}",
         request_url
     ))
 }
@@ -101,6 +102,7 @@ pub struct GcpPubSubTaskQueue<T: Task> {
     oauth_token_provider: GcpOauthTokenProvider,
     phantom_task: PhantomData<*const T>,
     agent: Agent,
+    logger: Logger,
 }
 
 impl<T: Task> GcpPubSubTaskQueue<T> {
@@ -109,7 +111,13 @@ impl<T: Task> GcpPubSubTaskQueue<T> {
         gcp_project_id: &str,
         subscription_id: &str,
         identity: Identity,
+        parent_logger: &Logger,
     ) -> Result<GcpPubSubTaskQueue<T>> {
+        let logger = parent_logger.new(o!(
+            "gcp_project_id" => gcp_project_id.to_owned(),
+            TASK_QUEUE_ID_EVENT_KEY => subscription_id.to_owned(),
+            IDENTITY_EVENT_KEY => identity.unwrap_or("default identity").to_owned(),
+        ));
         Ok(GcpPubSubTaskQueue {
             pubsub_api_endpoint: pubsub_api_endpoint
                 .unwrap_or(PUBSUB_API_BASE_URL)
@@ -122,6 +130,7 @@ impl<T: Task> GcpPubSubTaskQueue<T> {
                 "https://www.googleapis.com/auth/pubsub",
                 identity.map(|x| x.to_string()),
                 None, // GCP key file; never used
+                &logger,
             )?,
             phantom_task: PhantomData,
             agent: AgentBuilder::new()
@@ -131,16 +140,14 @@ impl<T: Task> GcpPubSubTaskQueue<T> {
                 // usual to allow for this.
                 .timeout(Duration::from_secs(180))
                 .build(),
+            logger,
         })
     }
 }
 
 impl<T: Task> TaskQueue<T> for GcpPubSubTaskQueue<T> {
     fn dequeue(&mut self) -> Result<Option<TaskHandle<T>>> {
-        info!(
-            "pull task from {}/{} as {:?}",
-            self.gcp_project_id, self.subscription_id, self.oauth_token_provider
-        );
+        info!(self.logger, "pull task");
 
         let request = prepare_request(
             &self.agent,
@@ -201,11 +208,8 @@ impl<T: Task> TaskQueue<T> for GcpPubSubTaskQueue<T> {
 
     fn acknowledge_task(&mut self, handle: TaskHandle<T>) -> Result<()> {
         info!(
-            "acknowledging task {} in topic {}/{} as {:?}",
-            handle.acknowledgment_id,
-            self.gcp_project_id,
-            self.subscription_id,
-            self.oauth_token_provider
+            self.logger, "acknowledging task";
+            TASK_ACKNOWLEDGEMENT_ID_EVENT_KEY => &handle.acknowledgment_id,
         );
 
         let request = prepare_request(
@@ -233,12 +237,8 @@ impl<T: Task> TaskQueue<T> for GcpPubSubTaskQueue<T> {
     }
 
     fn nacknowledge_task(&mut self, handle: TaskHandle<T>) -> Result<()> {
-        info!(
-            "nacknowledging task {} in topic {}/{} as {:?}",
-            handle.acknowledgment_id,
-            self.gcp_project_id,
-            self.subscription_id,
-            self.oauth_token_provider,
+        info!(self.logger, "nacknowledging task";
+            TASK_ACKNOWLEDGEMENT_ID_EVENT_KEY => &handle.acknowledgment_id
         );
 
         self.modify_ack_deadline(&handle, &Duration::from_secs(0))
@@ -247,11 +247,8 @@ impl<T: Task> TaskQueue<T> for GcpPubSubTaskQueue<T> {
 
     fn extend_task_deadline(&mut self, handle: &TaskHandle<T>, increment: &Duration) -> Result<()> {
         info!(
-            "extending deadline on task {} in topic {}/{} as {:?}",
-            handle.acknowledgment_id,
-            self.gcp_project_id,
-            self.subscription_id,
-            self.oauth_token_provider,
+            self.logger, "extending deadline on task";
+            TASK_ACKNOWLEDGEMENT_ID_EVENT_KEY => &handle.acknowledgment_id,
         );
 
         self.modify_ack_deadline(handle, increment)

@@ -4,7 +4,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use log::{debug, info};
+use slog::{Logger, debug, info, o};
 use rusoto_core::{
     credential::{
         AutoRefreshingProvider, AwsCredentials, CredentialsError, DefaultCredentialsProvider,
@@ -68,10 +68,10 @@ pub enum Provider {
 impl Provider {
     /// Instantiates an appropriate Provider based on the provided configuration
     /// values
-    pub fn new(identity: Identity, use_default_provider: bool, purpose: &str) -> Result<Self> {
+    pub fn new(identity: Identity, use_default_provider: bool, purpose: &str, logger: &Logger) -> Result<Self> {
         match (use_default_provider, identity) {
             (true, _) => Self::new_default(),
-            (_, Some(identity)) => Self::new_web_identity_with_oidc(identity, purpose.to_owned()),
+            (_, Some(identity)) => Self::new_web_identity_with_oidc(identity, purpose.to_owned(), logger),
             (_, None) => Self::new_web_identity_from_kubernetes_environment(),
         }
     }
@@ -106,19 +106,19 @@ impl Provider {
             .expect("could not parse token metadata api url")
     }
 
-    fn new_web_identity_with_oidc(iam_role: &str, purpose: String) -> Result<Self> {
+    fn new_web_identity_with_oidc(iam_role: &str, purpose: String, logger: &Logger) -> Result<Self> {
         // When running in GKE, the token used to authenticate to AWS S3 is
         // available from the instance metadata service.
         // See terraform/modules/kubernetes/kubernetes.tf for discussion.
         // This dynamic variable lets us provide a callback for fetching tokens,
         // allowing Rusoto to automatically get new credentials if they expire
         // (which they do every hour).
-        let iam_role_clone = iam_role.to_owned();
+        let token_logger = logger.new(o!(
+            "iam_role" => iam_role.to_owned(),
+            "purpose" => purpose.clone(),
+        ));
         let oidc_token_variable = Variable::dynamic(move || {
-            debug!(
-                "obtaining OIDC token from GKE metadata service for IAM role {} and purpose {}",
-                iam_role_clone, purpose
-            );
+            debug!(token_logger, "obtaining OIDC token from GKE metadata service");
             let aws_account_id = env::var("AWS_ACCOUNT_ID").map_err(|e| {
                 CredentialsError::new(format!(
                     "could not read AWS account ID from environment: {}",
@@ -228,7 +228,7 @@ const MAX_ATTEMPT_COUNT: i32 = 3;
 /// contain an HttpDispatchError! Sadly, CredentialsError does not preserve the
 /// structure of the underlying error, just its message, so we must resort to
 /// matching on a substring in order to detect it.
-pub fn retry_request<F, T, E>(action: &str, mut f: F) -> RusotoResult<T, E>
+pub fn retry_request<F, T, E>(action: &str, logger: &Logger, mut f: F) -> RusotoResult<T, E>
 where
     F: FnMut() -> RusotoResult<T, E>,
     E: Debug,
@@ -241,7 +241,7 @@ where
                 if attempts >= MAX_ATTEMPT_COUNT {
                     break Err(err);
                 }
-                info!(
+                info!(logger,
                     "failed to {} (will retry {} more times): {:?}",
                     action,
                     MAX_ATTEMPT_COUNT - attempts,
@@ -249,7 +249,7 @@ where
                 );
             }
             Err(err) => {
-                debug!("encountered non retryable error: {:?}", err);
+                debug!(logger, "encountered non retryable error: {:?}", err);
                 break Err(err);
             }
             result => break result,
@@ -268,14 +268,16 @@ fn retryable<T>(error: &RusotoError<T>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logging::setup_test_logging;
     use assert_matches::assert_matches;
     use rusoto_core::request::HttpDispatchError;
 
     #[test]
     fn retry_request_success() {
+        let logger = setup_test_logging();
         let mut attempts = 0;
 
-        let result = retry_request::<_, _, RusotoError<String>>("successful request", || {
+        let result = retry_request::<_, _, RusotoError<String>>("successful request", &logger, || {
             attempts += 1;
             Ok("success")
         });
@@ -285,10 +287,11 @@ mod tests {
 
     #[test]
     fn non_retryable_error() {
+        let logger = setup_test_logging();
         let mut attempts = 0;
         let error_message = "not retryable";
 
-        let result: RusotoResult<String, String> = retry_request("not retryable", || {
+        let result: RusotoResult<String, String> = retry_request("not retryable", &logger, || {
             attempts += 1;
             Err(RusotoError::Validation(error_message.to_string()))
         });
@@ -300,10 +303,11 @@ mod tests {
 
     #[test]
     fn retry_request_http_dispatch_error() {
+        let logger = setup_test_logging();
         let mut attempts = 0;
         let error_message = "http_dispatch_error";
 
-        let result: RusotoResult<String, String> = retry_request(error_message, || {
+        let result: RusotoResult<String, String> = retry_request(error_message, &logger, || {
             attempts += 1;
             Err(RusotoError::HttpDispatch(HttpDispatchError::new(
                 error_message.to_string(),
@@ -317,11 +321,12 @@ mod tests {
 
     #[test]
     fn retry_request_credentials_http_dispatch_error() {
+        let logger = setup_test_logging();
         let mut attempts = 0;
         let error_message = "something Error during dispatch something";
 
         let result: RusotoResult<String, String> =
-            retry_request("credentials dispatch error", || {
+            retry_request("credentials dispatch error", &logger, || {
                 attempts += 1;
                 Err(RusotoError::Credentials(CredentialsError::new(
                     error_message.to_string(),
@@ -335,11 +340,12 @@ mod tests {
 
     #[test]
     fn non_retryable_credentials_error() {
+        let logger = setup_test_logging();
         let mut attempts = 0;
         let error_message = "not a dispatch error";
 
         let result: RusotoResult<String, String> =
-            retry_request("non retryable credentials dispatch error", || {
+            retry_request("non retryable credentials dispatch error", &logger, || {
                 attempts += 1;
                 Err(RusotoError::Credentials(CredentialsError::new(
                     error_message.to_string(),

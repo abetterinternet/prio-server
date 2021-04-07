@@ -5,11 +5,14 @@ use crate::{
         prepare_request, prepare_request_without_agent, Method, OauthTokenProvider,
         RequestParameters, StaticOauthTokenProvider,
     },
+    logging::{
+        IDENTITY_EVENT_KEY, STORAGE_KEY_EVENT_KEY, STORAGE_PATH_EVENT_KEY, TRACE_ID_EVENT_KEY,
+    },
     transport::{Transport, TransportWriter},
     Error,
 };
 use anyhow::{anyhow, Context, Result};
-use log::info;
+use slog::{debug, info, o, Logger};
 use std::{
     io,
     io::{Read, Write},
@@ -49,6 +52,7 @@ pub struct GCSTransport {
     path: GCSPath,
     oauth_token_provider: GcpOauthTokenProvider,
     agent: Agent,
+    logger: Logger,
 }
 
 impl GCSTransport {
@@ -61,19 +65,27 @@ impl GCSTransport {
         path: GCSPath,
         identity: Identity,
         key_file_reader: Option<Box<dyn Read>>,
+        parent_logger: &Logger,
     ) -> Result<GCSTransport> {
+        let logger = parent_logger.new(o!(
+            STORAGE_PATH_EVENT_KEY => format!("{}", path),
+            IDENTITY_EVENT_KEY => identity.unwrap_or("default identity").to_owned(),
+        ));
+        let oauth_token_provider = GcpOauthTokenProvider::new(
+            // This token is used to access GCS storage
+            // https://developers.google.com/identity/protocols/oauth2/scopes#storage
+            "https://www.googleapis.com/auth/devstorage.read_write",
+            identity.map(|x| x.to_string()),
+            key_file_reader,
+            &logger,
+        )?;
         Ok(GCSTransport {
             path: path.ensure_directory_prefix(),
-            oauth_token_provider: GcpOauthTokenProvider::new(
-                // This token is used to access GCS storage
-                // https://developers.google.com/identity/protocols/oauth2/scopes#storage
-                "https://www.googleapis.com/auth/devstorage.read_write",
-                identity.map(|x| x.to_string()),
-                key_file_reader,
-            )?,
+            oauth_token_provider,
             agent: AgentBuilder::new()
                 .timeout(Duration::from_secs(120))
                 .build(),
+            logger,
         })
     }
 }
@@ -83,11 +95,13 @@ impl Transport for GCSTransport {
         self.path.to_string()
     }
 
-    fn get(&mut self, key: &str) -> Result<Box<dyn Read>> {
+    fn get(&mut self, key: &str, trace_id: &str) -> Result<Box<dyn Read>> {
         info!(
-            "get {}/{} as {:?}",
-            self.path, key, self.oauth_token_provider
+            self.logger, "get";
+            TRACE_ID_EVENT_KEY => trace_id,
+            STORAGE_KEY_EVENT_KEY => key,
         );
+
         // Per API reference, the object key must be URL encoded.
         // API reference: https://cloud.google.com/storage/docs/json_api/v1/objects/get
         let encoded_key = urlencoding::encode(&[&self.path.key, key].concat());
@@ -114,11 +128,13 @@ impl Transport for GCSTransport {
         Ok(Box::new(response.into_reader()))
     }
 
-    fn put(&mut self, key: &str) -> Result<Box<dyn TransportWriter>> {
-        info!(
-            "put {}/{} as {:?}",
-            self.path, key, self.oauth_token_provider
-        );
+    fn put(&mut self, key: &str, trace_id: &str) -> Result<Box<dyn TransportWriter>> {
+        let logger = self.logger.new(o!(
+            STORAGE_KEY_EVENT_KEY => key.to_owned(),
+            TRACE_ID_EVENT_KEY => trace_id.to_owned(),
+        ));
+        info!(logger, "put");
+
         // The Oauth token will only be used once, during the call to
         // StreamingTransferWriter::new, so we don't have to worry about it
         // expiring during the lifetime of that object, and so obtain a token
@@ -129,6 +145,7 @@ impl Transport for GCSTransport {
             self.path.bucket.to_owned(),
             [&self.path.key, key].concat(),
             oauth_token,
+            &logger,
         )?;
         Ok(Box::new(writer))
     }
@@ -164,6 +181,7 @@ struct StreamingTransferWriter {
     object_upload_position: usize,
     buffer: Vec<u8>,
     agent: Agent,
+    logger: Logger,
 }
 
 impl StreamingTransferWriter {
@@ -171,7 +189,12 @@ impl StreamingTransferWriter {
     /// the name of the GCS bucket. Object is the full name of the object being
     /// uploaded, which may contain path separators or file extensions.
     /// oauth_token is used to initiate the initial resumable upload request.
-    fn new(bucket: String, object: String, oauth_token: String) -> Result<StreamingTransferWriter> {
+    fn new(
+        bucket: String,
+        object: String,
+        oauth_token: String,
+        parent_logger: &Logger,
+    ) -> Result<StreamingTransferWriter> {
         StreamingTransferWriter::new_with_api_url(
             bucket,
             object,
@@ -180,6 +203,7 @@ impl StreamingTransferWriter {
             // https://cloud.google.com/storage/docs/performing-resumable-uploads#chunked-upload
             8_388_608,
             storage_api_base_url(),
+            parent_logger,
         )
     }
 
@@ -189,7 +213,12 @@ impl StreamingTransferWriter {
         oauth_token: String,
         minimum_upload_chunk_size: usize,
         storage_api_base_url: Url,
+        parent_logger: &Logger,
     ) -> Result<StreamingTransferWriter> {
+        let logger = parent_logger.new(o!(
+            STORAGE_KEY_EVENT_KEY => object.clone(),
+        ));
+
         // Initiate the resumable, streaming upload.
         // https://cloud.google.com/storage/docs/performing-resumable-uploads#initiate-session
         let mut upload_url = gcp_upload_object_url(&storage_api_base_url.to_string(), &bucket)?;
@@ -199,6 +228,7 @@ impl StreamingTransferWriter {
             .append_pair("name", &object)
             .finish();
 
+        debug!(logger, "initiating multi-part upload");
         let request = prepare_request_without_agent(RequestParameters {
             url: upload_url,
             method: Method::Post,
@@ -232,6 +262,7 @@ impl StreamingTransferWriter {
             agent: AgentBuilder::new()
                 .timeout(Duration::from_secs(120))
                 .build(),
+            logger,
         })
     }
 
@@ -246,6 +277,10 @@ impl StreamingTransferWriter {
             ));
         }
 
+        debug!(
+            self.logger, "uploading object chunk";
+            "upload_session_uri" => self.upload_session_uri.to_string()
+        );
         // When this is the last piece being uploaded, the Content-Range header
         // should include the total object size, but otherwise should have * to
         // indicate to GCS that there is an unknown further amount to come.
@@ -367,6 +402,10 @@ impl Write for StreamingTransferWriter {
 
 impl TransportWriter for StreamingTransferWriter {
     fn complete_upload(&mut self) -> Result<()> {
+        debug!(
+            self.logger,
+            "completing upload to {}", self.upload_session_uri
+        );
         while !self.buffer.is_empty() {
             self.upload_chunk(true)?;
         }
@@ -374,6 +413,10 @@ impl TransportWriter for StreamingTransferWriter {
     }
 
     fn cancel_upload(&mut self) -> Result<()> {
+        debug!(
+            self.logger,
+            "canceling upload to {}", self.upload_session_uri
+        );
         // https://cloud.google.com/storage/docs/performing-resumable-uploads#cancel-upload
         let mut request = prepare_request(
             &self.agent,
@@ -400,10 +443,13 @@ impl TransportWriter for StreamingTransferWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logging::setup_test_logging;
     use mockito::{mock, Matcher};
 
     #[test]
     fn simple_upload() {
+        let logger = setup_test_logging();
+
         let fake_upload_session_uri = format!("{}/fake-session-uri", mockito::server_url());
         let mocked_post = mock("POST", "/upload/storage/v1/b/fake-bucket/o/")
             .match_header("Authorization", "Bearer fake-token")
@@ -427,6 +473,7 @@ mod tests {
             "fake-token".to_string(),
             10,
             Url::parse(&mockito::server_url()).expect("unable to parse mockito server url"),
+            &logger,
         )
         .unwrap();
 
@@ -448,6 +495,8 @@ mod tests {
 
     #[test]
     fn multi_chunk_upload() {
+        let logger = setup_test_logging();
+
         let fake_upload_session_uri = format!("{}/fake-session-uri", mockito::server_url());
         let mocked_post = mock("POST", "/upload/storage/v1/b/fake-bucket/o/")
             .match_header("Authorization", "Bearer fake-token")
@@ -471,6 +520,7 @@ mod tests {
             "fake-token".to_string(),
             4,
             Url::parse(&mockito::server_url()).expect("unable to parse mockito server url"),
+            &logger,
         )
         .unwrap();
 

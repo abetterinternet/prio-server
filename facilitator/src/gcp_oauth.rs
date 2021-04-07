@@ -1,8 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::{prelude::Utc, DateTime, Duration};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-use log::debug;
 use serde::{Deserialize, Serialize};
+use slog::{debug, o, Logger};
 use std::{fmt, io::Read};
 use ureq::{Agent, Response};
 use url::Url;
@@ -111,6 +111,8 @@ pub(crate) struct GcpOauthTokenProvider {
     /// The Agent will be used when making HTTP requests to GCP APIs to fetch
     /// Oauth tokens.
     agent: Agent,
+    /// Logger to which messages shall be logged.
+    logger: Logger,
 }
 
 impl fmt::Debug for GcpOauthTokenProvider {
@@ -158,6 +160,7 @@ impl GcpOauthTokenProvider {
         scope: &str,
         account_to_impersonate: Option<String>,
         key_file_reader: Option<Box<dyn Read>>,
+        parent_logger: &Logger,
     ) -> Result<GcpOauthTokenProvider> {
         let key_file: Option<ServiceAccountKeyFile> = match key_file_reader {
             Some(reader) => {
@@ -166,6 +169,10 @@ impl GcpOauthTokenProvider {
             None => None,
         };
         let agent = create_agent();
+        let logger = parent_logger.new(o!(
+            "scope" => scope.to_owned(),
+            "account_to_impersonate" => account_to_impersonate.clone().unwrap_or("none".to_owned()),
+        ));
 
         Ok(GcpOauthTokenProvider {
             scope: scope.to_owned(),
@@ -174,6 +181,7 @@ impl GcpOauthTokenProvider {
             default_account_token: None,
             impersonated_account_token: None,
             agent,
+            logger,
         })
     }
 
@@ -184,10 +192,7 @@ impl GcpOauthTokenProvider {
     fn ensure_default_account_token(&mut self) -> Result<String> {
         if let Some(token) = &self.default_account_token {
             if !token.expired() {
-                debug!(
-                    "cached default account token is still valid. Scope: {}",
-                    self.scope
-                );
+                debug!(self.logger, "cached default account token is still valid");
                 return Ok(token.token.clone());
             }
         }
@@ -218,8 +223,8 @@ impl GcpOauthTokenProvider {
     /// call was successful.
     fn account_token_from_gke_metadata_service(&self) -> Result<Response> {
         debug!(
-            "obtaining default account token from GKE metadata service. Scope: {}",
-            self.scope
+            self.logger,
+            "obtaining default account token from GKE metadata service"
         );
         let mut request = prepare_request(
             &self.agent,
@@ -243,10 +248,7 @@ impl GcpOauthTokenProvider {
     /// an OauthTokenResponse if the HTTP call was successful, but may be an
     /// error.
     fn account_token_with_key_file(&self, key_file: &ServiceAccountKeyFile) -> Result<Response> {
-        debug!(
-            "obtaining account token from key file. Scope: {}",
-            self.scope
-        );
+        debug!(self.logger, "obtaining account token from key file");
         // We construct the JWT per Google documentation:
         // https://developers.google.com/identity/protocols/oauth2/service-account#authorizingrequests
         let mut header = Header::new(Algorithm::RS256);
@@ -302,8 +304,8 @@ impl GcpOauthTokenProvider {
         if let Some(token) = &self.impersonated_account_token {
             if !token.expired() {
                 debug!(
-                    "cached token is still valid for service account {:?} and scope {:?}",
-                    self.account_to_impersonate, self.scope
+                    self.logger,
+                    "cached token is still valid for impersonating service account"
                 );
                 return Ok(token.token.clone());
             }
@@ -322,8 +324,8 @@ impl GcpOauthTokenProvider {
         )?;
 
         debug!(
-            "obtaining token for service account {:?} and scope {:?}",
-            self.account_to_impersonate, self.scope
+            self.logger,
+            "obtaining token to impersonate service account"
         );
         let http_response = send_json_request(
             request,

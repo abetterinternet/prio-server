@@ -1,16 +1,16 @@
 use anyhow::{anyhow, Context, Result};
 use derivative::Derivative;
-use log::info;
 use rusoto_core::Region;
 use rusoto_sqs::{
     ChangeMessageVisibilityRequest, DeleteMessageRequest, ReceiveMessageRequest, Sqs, SqsClient,
 };
+use slog::{info, o, Logger};
 use std::{convert::TryFrom, marker::PhantomData, str::FromStr, time::Duration};
 use tokio::runtime::Runtime;
 
-use crate::aws_credentials;
 use crate::{
-    aws_credentials::{basic_runtime, retry_request},
+    aws_credentials::{self, basic_runtime, retry_request},
+    logging::{IDENTITY_EVENT_KEY, TASK_ACKNOWLEDGEMENT_ID_EVENT_KEY, TASK_QUEUE_ID_EVENT_KEY},
     task::{Task, TaskHandle, TaskQueue},
 };
 
@@ -23,6 +23,7 @@ pub struct AwsSqsTaskQueue<T: Task> {
     runtime: Runtime,
     #[derivative(Debug = "ignore")]
     credentials_provider: aws_credentials::Provider,
+    logger: Logger,
     phantom_task: PhantomData<*const T>,
 }
 
@@ -31,15 +32,21 @@ impl<T: Task> AwsSqsTaskQueue<T> {
         region: &str,
         queue_url: &str,
         credentials_provider: aws_credentials::Provider,
+        parent_logger: &Logger,
     ) -> Result<Self> {
         let region = Region::from_str(region).context("invalid AWS region")?;
         let runtime = basic_runtime()?;
+        let logger = parent_logger.new(o!(
+            TASK_QUEUE_ID_EVENT_KEY => queue_url.to_owned(),
+            IDENTITY_EVENT_KEY => format!("{}", credentials_provider),
+        ));
 
         Ok(AwsSqsTaskQueue {
             region,
             queue_url: queue_url.to_owned(),
             runtime,
             credentials_provider,
+            logger,
             phantom_task: PhantomData,
         })
     }
@@ -47,14 +54,11 @@ impl<T: Task> AwsSqsTaskQueue<T> {
 
 impl<T: Task> TaskQueue<T> for AwsSqsTaskQueue<T> {
     fn dequeue(&mut self) -> Result<Option<TaskHandle<T>>> {
-        info!(
-            "pull task from {} as {}",
-            self.queue_url, self.credentials_provider
-        );
+        info!(self.logger, "pull task");
 
         let client = self.sqs_client()?;
 
-        let response = retry_request("dequeue SQS message", || {
+        let response = retry_request("dequeue SQS message", &self.logger, || {
             let request = ReceiveMessageRequest {
                 // Dequeue one task at a time
                 max_number_of_messages: Some(1),
@@ -110,13 +114,13 @@ impl<T: Task> TaskQueue<T> for AwsSqsTaskQueue<T> {
 
     fn acknowledge_task(&mut self, task: TaskHandle<T>) -> Result<()> {
         info!(
-            "acknowledging task {} in queue {} as {}",
-            task.acknowledgment_id, self.queue_url, self.credentials_provider,
+            self.logger, "acknowledging task";
+            TASK_ACKNOWLEDGEMENT_ID_EVENT_KEY => &task.acknowledgment_id
         );
 
         let client = self.sqs_client()?;
 
-        retry_request("delete/acknowledge message in SQS", || {
+        retry_request("delete/acknowledge message in SQS", &self.logger, || {
             let request = DeleteMessageRequest {
                 queue_url: self.queue_url.clone(),
                 receipt_handle: task.acknowledgment_id.clone(),
@@ -131,8 +135,8 @@ impl<T: Task> TaskQueue<T> for AwsSqsTaskQueue<T> {
         // timeout to 0
         // https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html#terminating-message-visibility-timeout
         info!(
-            "nacknowledging task {} in queue {} as {}",
-            task.acknowledgment_id, self.queue_url, self.credentials_provider,
+            self.logger, "nacknowledging task";
+            TASK_ACKNOWLEDGEMENT_ID_EVENT_KEY => &task.acknowledgment_id
         );
 
         self.change_message_visibility(&task, &Duration::from_secs(0))
@@ -141,8 +145,8 @@ impl<T: Task> TaskQueue<T> for AwsSqsTaskQueue<T> {
 
     fn extend_task_deadline(&mut self, task: &TaskHandle<T>, increment: &Duration) -> Result<()> {
         info!(
-            "extending deadline on task {} in queue {} by 10 minutes",
-            task.acknowledgment_id, self.queue_url
+            self.logger, "extending deadline on task by 10 minutes";
+            TASK_ACKNOWLEDGEMENT_ID_EVENT_KEY => &task.acknowledgment_id
         );
 
         self.change_message_visibility(task, increment)
@@ -182,7 +186,7 @@ impl<T: Task> AwsSqsTaskQueue<T> {
             visibility_timeout
         ))?;
 
-        retry_request("changing message visibility", || {
+        retry_request("changing message visibility", &self.logger, || {
             let request = ChangeMessageVisibilityRequest {
                 queue_url: self.queue_url.clone(),
                 receipt_handle: task.acknowledgment_id.clone(),

@@ -2,18 +2,21 @@ use crate::aws_credentials;
 use crate::{
     aws_credentials::{basic_runtime, retry_request},
     config::S3Path,
+    logging::{
+        IDENTITY_EVENT_KEY, STORAGE_KEY_EVENT_KEY, STORAGE_PATH_EVENT_KEY, TRACE_ID_EVENT_KEY,
+    },
     transport::{Transport, TransportWriter},
     Error,
 };
 use anyhow::{Context, Result};
 use derivative::Derivative;
 use hyper_rustls::HttpsConnector;
-use log::info;
 use rusoto_core::{ByteStream, Region};
 use rusoto_s3::{
     AbortMultipartUploadRequest, CompleteMultipartUploadRequest, CompletedMultipartUpload,
     CompletedPart, CreateMultipartUploadRequest, GetObjectRequest, S3Client, UploadPartRequest, S3,
 };
+use slog::{info, o, Logger};
 use std::{
     io::{Read, Write},
     mem,
@@ -38,10 +41,15 @@ pub struct S3Transport {
     // client_provider allows injection of mock S3Client for testing purposes
     #[derivative(Debug = "ignore")]
     client_provider: ClientProvider,
+    logger: Logger,
 }
 
 impl S3Transport {
-    pub fn new(path: S3Path, credentials_provider: aws_credentials::Provider) -> Self {
+    pub fn new(
+        path: S3Path,
+        credentials_provider: aws_credentials::Provider,
+        parent_logger: &Logger,
+    ) -> Self {
         S3Transport::new_with_client(
             path,
             credentials_provider,
@@ -72,6 +80,7 @@ impl S3Transport {
                     ))
                 },
             ),
+            parent_logger,
         )
     }
 
@@ -79,11 +88,17 @@ impl S3Transport {
         path: S3Path,
         credentials_provider: aws_credentials::Provider,
         client_provider: ClientProvider,
+        parent_logger: &Logger,
     ) -> Self {
+        let logger = parent_logger.new(o!(
+            STORAGE_PATH_EVENT_KEY => format!("{}", path),
+            IDENTITY_EVENT_KEY => format!("{}", credentials_provider),
+        ));
         S3Transport {
             path: path.ensure_directory_prefix(),
             credentials_provider,
             client_provider,
+            logger,
         }
     }
 }
@@ -93,12 +108,16 @@ impl Transport for S3Transport {
         self.path.to_string()
     }
 
-    fn get(&mut self, key: &str) -> Result<Box<dyn Read>> {
-        info!("get {}/{} as {}", self.path, key, self.credentials_provider);
+    fn get(&mut self, key: &str, trace_id: &str) -> Result<Box<dyn Read>> {
+        info!(
+            self.logger, "get";
+            STORAGE_KEY_EVENT_KEY => key,
+            TRACE_ID_EVENT_KEY => trace_id,
+        );
         let runtime = basic_runtime()?;
         let client = (self.client_provider)(&self.path.region, self.credentials_provider.clone())?;
 
-        let get_output = retry_request("get s3 object", || {
+        let get_output = retry_request("get s3 object", &self.logger, || {
             runtime.block_on(client.get_object(GetObjectRequest {
                 bucket: self.path.bucket.to_owned(),
                 key: [&self.path.key, key].concat(),
@@ -112,8 +131,13 @@ impl Transport for S3Transport {
         Ok(Box::new(StreamingBodyReader::new(body, runtime)))
     }
 
-    fn put(&mut self, key: &str) -> Result<Box<dyn TransportWriter>> {
-        info!("put {}/{} as {}", self.path, key, self.credentials_provider);
+    fn put(&mut self, key: &str, trace_id: &str) -> Result<Box<dyn TransportWriter>> {
+        let logger = self.logger.new(o!(
+            STORAGE_KEY_EVENT_KEY => key.to_owned(),
+            TRACE_ID_EVENT_KEY =>  trace_id.to_owned(),
+        ));
+        info!(logger, "put");
+
         let writer = MultipartUploadWriter::new(
             self.path.bucket.to_owned(),
             format!("{}{}", &self.path.key, key),
@@ -121,6 +145,7 @@ impl Transport for S3Transport {
             // https://docs.aws.amazon.com/AmazonS3/latest/dev/qfacts.html
             5_242_880,
             (self.client_provider)(&self.path.region, self.credentials_provider.clone())?,
+            &logger,
         )?;
         Ok(Box::new(writer))
     }
@@ -170,6 +195,7 @@ struct MultipartUploadWriter {
     completed_parts: Vec<CompletedPart>,
     minimum_upload_part_size: usize,
     buffer: Vec<u8>,
+    logger: Logger,
 }
 
 impl MultipartUploadWriter {
@@ -182,13 +208,15 @@ impl MultipartUploadWriter {
         key: String,
         minimum_upload_part_size: usize,
         client: S3Client,
+        parent_logger: &Logger,
     ) -> Result<MultipartUploadWriter> {
         let runtime = basic_runtime()?;
+        let logger = parent_logger.new(o!());
 
         // We use the "bucket-owner-full-control" canned ACL to ensure that
         // objects we send to peers will be owned by them.
         // https://docs.aws.amazon.com/AmazonS3/latest/dev/about-object-ownership.html
-        let create_output = retry_request("create multipart upload", || {
+        let create_output = retry_request("create multipart upload", &logger, || {
             runtime.block_on(
                 client.create_multipart_upload(CreateMultipartUploadRequest {
                     bucket: bucket.to_string(),
@@ -217,6 +245,7 @@ impl MultipartUploadWriter {
             // that the caller will overflow it.
             minimum_upload_part_size,
             buffer: Vec::with_capacity(minimum_upload_part_size * 2),
+            logger,
         })
     }
 
@@ -236,7 +265,7 @@ impl MultipartUploadWriter {
             Vec::with_capacity(self.minimum_upload_part_size * 2),
         );
 
-        let upload_output = retry_request("upload part", || {
+        let upload_output = retry_request("upload part", &self.logger, || {
             self.runtime
                 .block_on(self.client.upload_part(UploadPartRequest {
                     bucket: self.bucket.to_string(),
@@ -302,7 +331,7 @@ impl TransportWriter for MultipartUploadWriter {
         // Ignore output for now, but we might want the e_tag to check the
         // digest
         let completed_parts = mem::take(&mut self.completed_parts);
-        retry_request("complete upload", || {
+        retry_request("complete upload", &self.logger, || {
             self.runtime.block_on(self.client.complete_multipart_upload(
                 CompleteMultipartUploadRequest {
                     bucket: self.bucket.to_string(),
@@ -338,7 +367,7 @@ impl TransportWriter for MultipartUploadWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::log_init;
+    use crate::logging::setup_test_logging;
     use rusoto_core::{request::HttpDispatchError, signature::SignedRequest};
     use rusoto_mock::{MockRequestDispatcher, MultipleMockRequestDispatcher};
     use rusoto_s3::CreateMultipartUploadError;
@@ -445,7 +474,7 @@ mod tests {
 
     #[test]
     fn multipart_upload_create_fails() {
-        log_init();
+        let logger = setup_test_logging();
         let err = MultipartUploadWriter::new(
             String::from(TEST_BUCKET),
             String::from(TEST_KEY),
@@ -456,6 +485,7 @@ mod tests {
                 aws_credentials::Provider::new_mock(),
                 Region::UsWest2,
             ),
+            &logger,
         )
         .expect_err("expected error");
         assert!(
@@ -467,7 +497,7 @@ mod tests {
 
     #[test]
     fn multipart_upload_create_no_upload_id() {
-        log_init();
+        let logger = setup_test_logging();
         // Response body format from
         // https://docs.aws.amazon.com/AmazonS3/latest/API/API_Operations_Amazon_Simple_Storage_Service.html
         MultipartUploadWriter::new(
@@ -487,17 +517,21 @@ mod tests {
                 aws_credentials::Provider::new_mock(),
                 Region::UsWest2,
             ),
+            &logger,
         )
         .expect_err("expected error");
     }
 
     #[test]
     fn multipart_upload() {
-        log_init();
+        let logger = setup_test_logging();
         // Response body format from
         // https://docs.aws.amazon.com/AmazonS3/latest/API/API_Operations_Amazon_Simple_Storage_Service.html
-        let mut writer =
-            MultipartUploadWriter::new(String::from(TEST_BUCKET), String::from(TEST_KEY), 50, {
+        let mut writer = MultipartUploadWriter::new(
+            String::from(TEST_BUCKET),
+            String::from(TEST_KEY),
+            50,
+            {
                 let requests = vec![
                     // Response to CreateMultipartUpload
                     MockRequestDispatcher::with_status(200)
@@ -573,8 +607,10 @@ mod tests {
                     aws_credentials::Provider::new_mock(),
                     Region::UsWest2,
                 )
-            })
-            .expect("failed to create multipart upload writer");
+            },
+            &logger,
+        )
+        .expect("failed to create multipart upload writer");
 
         // First write will fail due to HTTP 401
         writer.write_all(&[0; 51]).unwrap_err();
@@ -596,7 +632,7 @@ mod tests {
 
     #[test]
     fn roundtrip_s3_transport() {
-        log_init();
+        let logger = setup_test_logging();
         let s3_path = S3Path {
             region: Region::UsWest2,
             bucket: TEST_BUCKET.into(),
@@ -618,9 +654,10 @@ mod tests {
             s3_path.clone(),
             aws_credentials::Provider::new_mock(),
             client_provider,
+            &logger,
         );
 
-        let ret = transport.get(TEST_KEY);
+        let ret = transport.get(TEST_KEY, "");
         assert!(ret.is_err(), "unexpected return value {:?}", ret.err());
 
         let mut transport = S3Transport::new_with_client(
@@ -638,10 +675,11 @@ mod tests {
                     ))
                 },
             ),
+            &logger,
         );
 
         let mut reader = transport
-            .get(TEST_KEY)
+            .get(TEST_KEY, "")
             .expect("unexpected error getting reader");
         let mut content = Vec::new();
         reader.read_to_end(&mut content).expect("failed to read");
@@ -692,9 +730,10 @@ mod tests {
                     ))
                 },
             ),
+            &logger,
         );
 
-        let mut writer = transport.put(TEST_KEY).unwrap();
+        let mut writer = transport.put(TEST_KEY, "").unwrap();
         writer.write_all(b"fake-content").unwrap();
         writer.complete_upload().unwrap();
         writer.cancel_upload().unwrap();

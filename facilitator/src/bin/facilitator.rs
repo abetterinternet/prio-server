@@ -2,12 +2,12 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{prelude::Utc, NaiveDateTime};
 use clap::{value_t, App, Arg, ArgGroup, ArgMatches, SubCommand};
 use kube::api::Resource;
-use log::{debug, error, info};
 use prio::encrypt::{PrivateKey, PublicKey};
 use ring::signature::{
     EcdsaKeyPair, KeyPair, UnparsedPublicKey, ECDSA_P256_SHA256_ASN1,
     ECDSA_P256_SHA256_ASN1_SIGNING,
 };
+use slog::{debug, error, info, o, Logger};
 use std::{
     collections::HashMap, fs, fs::File, io::Read, str::FromStr, time::Duration, time::Instant,
 };
@@ -19,7 +19,7 @@ use facilitator::{
     config::{leak_string, Entity, Identity, InOut, ManifestKind, StoragePath, TaskQueueKind},
     intake::BatchIntaker,
     kubernetes::KubernetesClient,
-    logging::setup_env_logging,
+    logging::{setup_logging, LoggingConfiguration, TASK_HANDLE_EVENT_KEY, TRACE_ID_EVENT_KEY},
     manifest::{
         DataShareProcessorGlobalManifest, IngestionServerManifest, PortalServerGlobalManifest,
         SpecificManifest,
@@ -616,14 +616,7 @@ impl<'a, 'b> AppArgumentAdder for App<'a, 'b> {
 }
 
 fn main() -> Result<(), anyhow::Error> {
-    setup_env_logging();
     let args: Vec<String> = std::env::args().collect();
-    info!(
-        "starting {} version {}. Args: [{}]",
-        args[0],
-        option_env!("BUILD_INFO").unwrap_or("(BUILD_INFO unavailable)"),
-        args[1..].join(" "),
-    );
     let matches = App::new("facilitator")
         .about("Prio data share processor")
         .arg(
@@ -631,6 +624,16 @@ fn main() -> Result<(), anyhow::Error> {
                 .long("pushgateway")
                 .env("PUSHGATEWAY")
                 .help("Address of a Prometheus pushgateway to push metrics to, in host:port form"),
+        )
+        .arg(
+            Arg::with_name("force-json-log-output")
+                .long("force-json-log-output")
+                .env("FORCE_JSON_LOG_OUTPUT")
+                .help("Force log output to JSON format")
+                .value_name("BOOL")
+                .possible_value("true")
+                .possible_value("false")
+                .default_value("false"),
         )
         .subcommand(
             SubCommand::with_name("generate-ingestion-sample")
@@ -864,18 +867,39 @@ fn main() -> Result<(), anyhow::Error> {
         )
         .get_matches();
 
+    let force_json_log_output = Some("true") == matches.value_of("force-json-log-output");
+
+    // We must keep _scope_logger_guard live or the global logger will be
+    // dropped and messages from modules that don't use their own slog::Logger
+    // will be discarded.
+    let (root_logger, _scope_logger_guard) = setup_logging(&LoggingConfiguration {
+        force_json_output: force_json_log_output,
+        version_string: option_env!("BUILD_INFO").unwrap_or("(BUILD_INFO unavailable)"),
+        log_level: option_env!("RUST_LOG").unwrap_or("INFO"),
+    })?;
+    info!(
+        root_logger,
+        "starting {}. Args: [{}]",
+        args[0],
+        args[1..].join(" "),
+    );
+
     let result = match matches.subcommand() {
         // The configuration of the Args above should guarantee that the
         // various parameters are present and valid, so it is safe to use
         // unwrap() here.
-        ("generate-ingestion-sample", Some(sub_matches)) => generate_sample(sub_matches),
-        ("generate-ingestion-sample-worker", Some(sub_matches)) => {
-            generate_sample_worker(&sub_matches)
+        ("generate-ingestion-sample", Some(sub_matches)) => {
+            generate_sample(sub_matches, &root_logger)
         }
-        ("intake-batch", Some(sub_matches)) => intake_batch_subcommand(sub_matches),
-        ("intake-batch-worker", Some(sub_matches)) => intake_batch_worker(sub_matches),
-        ("aggregate", Some(sub_matches)) => aggregate_subcommand(sub_matches),
-        ("aggregate-worker", Some(sub_matches)) => aggregate_worker(sub_matches),
+        ("generate-ingestion-sample-worker", Some(sub_matches)) => {
+            generate_sample_worker(&sub_matches, &root_logger)
+        }
+        ("intake-batch", Some(sub_matches)) => intake_batch_subcommand(sub_matches, &root_logger),
+        ("intake-batch-worker", Some(sub_matches)) => {
+            intake_batch_worker(sub_matches, &root_logger)
+        }
+        ("aggregate", Some(sub_matches)) => aggregate_subcommand(sub_matches, &root_logger),
+        ("aggregate-worker", Some(sub_matches)) => aggregate_worker(sub_matches, &root_logger),
         ("lint-manifest", Some(sub_matches)) => lint_manifest(sub_matches),
         (_, _) => Ok(()),
     };
@@ -883,16 +907,21 @@ fn main() -> Result<(), anyhow::Error> {
     result
 }
 
-fn generate_sample_worker(sub_matches: &ArgMatches) -> Result<(), anyhow::Error> {
+fn generate_sample_worker(
+    sub_matches: &ArgMatches,
+    root_logger: &Logger,
+) -> Result<(), anyhow::Error> {
     let interval = value_t!(sub_matches.value_of("generation-interval"), u64)?;
 
     loop {
-        info!("Starting a sample generation job.");
-        let result = generate_sample(&sub_matches);
+        let trace_id = Uuid::new_v4();
+        let logger = root_logger.new(o!(
+            TRACE_ID_EVENT_KEY => trace_id.to_string(),
+        ));
+        let result = generate_sample(&sub_matches, &logger);
 
-        match result {
-            Ok(()) => info!("\tSuccess"),
-            Err(e) => error!("\tError: {:?}", e),
+        if let Err(e) = result {
+            error!(logger, "Error: {:?}", e);
         }
         std::thread::sleep(Duration::from_secs(interval))
     }
@@ -903,6 +932,7 @@ fn get_ecies_public_key(
     manifest_url: Option<&str>,
     ingestor_name: Option<&str>,
     locality_name: Option<&str>,
+    logger: &Logger,
 ) -> Result<PublicKey> {
     match key_option {
         Some(key) => {
@@ -941,8 +971,10 @@ fn get_ecies_public_key(
                     .context("unable to create public key from base64 ecies key")?;
 
                 debug!(
+                    logger,
                     "Picked packet decryption key with ID: {} - public key {:?}",
-                    key_identifier, &public_key
+                    key_identifier,
+                    &public_key
                 );
 
                 Ok(public_key)
@@ -1032,7 +1064,7 @@ fn get_valid_batch_signing_key(
     }
 }
 
-fn generate_sample(sub_matches: &ArgMatches) -> Result<(), anyhow::Error> {
+fn generate_sample(sub_matches: &ArgMatches, logger: &Logger) -> Result<(), anyhow::Error> {
     let kube_namespace = sub_matches.value_of("kube-namespace");
     let ingestor_manifest_base_url = sub_matches.value_of("ingestor-manifest-base-url");
 
@@ -1049,11 +1081,6 @@ fn generate_sample(sub_matches: &ArgMatches) -> Result<(), anyhow::Error> {
         ingestor_name,
         locality_name,
     )?;
-    info!(
-        "peer-idenity: {}, peer_output_path: {}",
-        &peer_identity.as_deref().unwrap_or("None"),
-        &peer_output_path
-    );
 
     let peer_output_path = StoragePath::from_str(&peer_output_path)?;
 
@@ -1062,6 +1089,7 @@ fn generate_sample(sub_matches: &ArgMatches) -> Result<(), anyhow::Error> {
         sub_matches.value_of("pha-manifest-base-url"),
         ingestor_name,
         locality_name,
+        logger,
     )?;
 
     let mut peer_transport = SampleOutput {
@@ -1071,6 +1099,7 @@ fn generate_sample(sub_matches: &ArgMatches) -> Result<(), anyhow::Error> {
                 peer_identity.as_deref(),
                 Entity::Peer,
                 sub_matches,
+                logger,
             )?,
             batch_signing_key: own_batch_signing_key,
         },
@@ -1086,12 +1115,6 @@ fn generate_sample(sub_matches: &ArgMatches) -> Result<(), anyhow::Error> {
         locality_name,
     )?;
 
-    info!(
-        "facilitator-idenity: {}, facilitator_output_path: {}",
-        &facilitator_identity.as_deref().unwrap_or("None"),
-        &faciliator_output
-    );
-
     let faciliator_output = StoragePath::from_str(&faciliator_output)?;
 
     let packet_encryption_public_key = get_ecies_public_key(
@@ -1099,6 +1122,7 @@ fn generate_sample(sub_matches: &ArgMatches) -> Result<(), anyhow::Error> {
         sub_matches.value_of("facilitator-manifest-base-url"),
         ingestor_name,
         locality_name,
+        logger,
     )
     .unwrap();
 
@@ -1112,6 +1136,7 @@ fn generate_sample(sub_matches: &ArgMatches) -> Result<(), anyhow::Error> {
                 facilitator_identity.as_deref(),
                 Entity::Facilitator,
                 sub_matches,
+                logger,
             )?,
             batch_signing_key: own_batch_signing_key,
         },
@@ -1127,9 +1152,13 @@ fn generate_sample(sub_matches: &ArgMatches) -> Result<(), anyhow::Error> {
         value_t!(sub_matches.value_of("batch-end-time"), i64)?,
         &mut peer_transport,
         &mut facilitator_transport,
+        &logger,
     );
 
+    let trace_id = Uuid::new_v4();
+
     sample_generator.generate_ingestion_sample(
+        &trace_id.to_string(),
         &value_t!(sub_matches.value_of("batch-id"), Uuid).unwrap_or_else(|_| Uuid::new_v4()),
         &sub_matches.value_of("date").map_or_else(
             || Utc::now().naive_utc(),
@@ -1147,9 +1176,10 @@ fn intake_batch<F: FnMut()>(
     date: &str,
     sub_matches: &ArgMatches,
     metrics_collector: Option<&IntakeMetricsCollector>,
+    logger: &Logger,
     callback: F,
 ) -> Result<(), anyhow::Error> {
-    let mut intake_transport = intake_transport_from_args(sub_matches)?;
+    let mut intake_transport = intake_transport_from_args(sub_matches, logger)?;
 
     // We need the bucket to which we will write validations for the
     // peer data share processor, which can either be fetched from the
@@ -1169,6 +1199,7 @@ fn intake_batch<F: FnMut()>(
             Entity::Peer,
             PathOrInOut::Path(peer_validation_bucket),
             sub_matches,
+            logger,
         )?,
         batch_signing_key: batch_signing_key_from_arg(sub_matches)?,
     };
@@ -1180,6 +1211,7 @@ fn intake_batch<F: FnMut()>(
             Entity::Own,
             PathOrInOut::InOut(InOut::Output),
             sub_matches,
+            logger,
         )?,
         batch_signing_key: batch_signing_key_from_arg(sub_matches)?,
     };
@@ -1198,6 +1230,7 @@ fn intake_batch<F: FnMut()>(
         &mut own_validation_transport,
         is_first_from_arg(sub_matches),
         Some("true") == sub_matches.value_of("permit-malformed-batch"),
+        logger,
     )?;
 
     if let Some("true") = sub_matches.value_of("use-bogus-packet-file-digest") {
@@ -1227,7 +1260,10 @@ fn intake_batch<F: FnMut()>(
     result
 }
 
-fn intake_batch_subcommand(sub_matches: &ArgMatches) -> Result<(), anyhow::Error> {
+fn intake_batch_subcommand(
+    sub_matches: &ArgMatches,
+    parent_logger: &Logger,
+) -> Result<(), anyhow::Error> {
     intake_batch(
         "None",
         sub_matches.value_of("aggregation-id").unwrap(),
@@ -1235,19 +1271,26 @@ fn intake_batch_subcommand(sub_matches: &ArgMatches) -> Result<(), anyhow::Error
         sub_matches.value_of("date").unwrap(),
         sub_matches,
         None,
+        parent_logger,
         || {}, // no-op callback
     )
 }
 
-fn intake_batch_worker(sub_matches: &ArgMatches) -> Result<(), anyhow::Error> {
+fn intake_batch_worker(
+    sub_matches: &ArgMatches,
+    parent_logger: &Logger,
+) -> Result<(), anyhow::Error> {
     let metrics_collector = IntakeMetricsCollector::new()?;
     let scrape_port = value_t!(sub_matches.value_of("metrics-scrape-port"), u16)?;
-    let _runtime = start_metrics_scrape_endpoint(scrape_port)?;
-    let mut queue = intake_task_queue_from_args(sub_matches)?;
+    let _runtime = start_metrics_scrape_endpoint(scrape_port, parent_logger)?;
+    let mut queue = intake_task_queue_from_args(sub_matches, parent_logger)?;
 
     loop {
         if let Some(task_handle) = queue.dequeue()? {
-            info!("dequeued task: {}", task_handle);
+            info!(
+                parent_logger, "dequeued task";
+                TASK_HANDLE_EVENT_KEY => format!("{}", task_handle)
+            );
             let task_start = Instant::now();
 
             let trace_id = task_handle
@@ -1263,11 +1306,12 @@ fn intake_batch_worker(sub_matches: &ArgMatches) -> Result<(), anyhow::Error> {
                 &task_handle.task.date,
                 sub_matches,
                 Some(&metrics_collector),
+                parent_logger,
                 || {
                     if let Err(e) =
                         queue.maybe_extend_task_deadline(&task_handle, &task_start.elapsed())
                     {
-                        error!("{}", e);
+                        error!(parent_logger, "{}", e);
                     }
                 },
             );
@@ -1275,7 +1319,10 @@ fn intake_batch_worker(sub_matches: &ArgMatches) -> Result<(), anyhow::Error> {
             match result {
                 Ok(_) => queue.acknowledge_task(task_handle)?,
                 Err(err) => {
-                    error!("error while processing task {}: {:?}", task_handle, err);
+                    error!(
+                        parent_logger, "error while processing task: {:?}", err;
+                        TASK_HANDLE_EVENT_KEY => format!("{}", task_handle)
+                    );
                     queue.nacknowledge_task(task_handle)?;
                 }
             }
@@ -1293,17 +1340,22 @@ fn aggregate<F: FnMut()>(
     batches: Vec<(&str, &str)>,
     sub_matches: &ArgMatches,
     metrics_collector: Option<&AggregateMetricsCollector>,
+    logger: &Logger,
     callback: F,
 ) -> Result<()> {
     let instance_name = sub_matches.value_of("instance-name").unwrap();
     let is_first = is_first_from_arg(sub_matches);
 
-    let mut intake_transport = intake_transport_from_args(sub_matches)?;
+    let mut intake_transport = intake_transport_from_args(sub_matches, logger)?;
 
     // We created the bucket to which we wrote copies of our validation
     // shares, so it is simply provided by argument.
-    let own_validation_transport =
-        transport_from_args(Entity::Own, PathOrInOut::InOut(InOut::Input), sub_matches)?;
+    let own_validation_transport = transport_from_args(
+        Entity::Own,
+        PathOrInOut::InOut(InOut::Input),
+        sub_matches,
+        logger,
+    )?;
 
     // To read our own validation shares, we require our own public keys which
     // we discover in our own specific manifest. If no manifest is provided, use
@@ -1331,8 +1383,12 @@ fn aggregate<F: FnMut()>(
 
     // We created the bucket that peers wrote validations into, and so
     // it is simply provided via argument.
-    let peer_validation_transport =
-        transport_from_args(Entity::Peer, PathOrInOut::InOut(InOut::Input), sub_matches)?;
+    let peer_validation_transport = transport_from_args(
+        Entity::Peer,
+        PathOrInOut::InOut(InOut::Input),
+        sub_matches,
+        logger,
+    )?;
 
     // We need the public keys the peer data share processor used to
     // sign messages, which we can obtain by argument or by discovering
@@ -1376,6 +1432,7 @@ fn aggregate<F: FnMut()>(
         Entity::Portal,
         PathOrInOut::Path(portal_bucket),
         sub_matches,
+        logger,
     )?;
 
     // Get the key we will use to sign sum part messages sent to the
@@ -1418,6 +1475,7 @@ fn aggregate<F: FnMut()>(
         &mut own_validation_transport,
         &mut peer_validation_transport,
         &mut aggregation_transport,
+        logger,
     )?;
 
     if let Some(collector) = metrics_collector {
@@ -1443,7 +1501,10 @@ fn aggregate<F: FnMut()>(
     result
 }
 
-fn aggregate_subcommand(sub_matches: &ArgMatches) -> Result<(), anyhow::Error> {
+fn aggregate_subcommand(
+    sub_matches: &ArgMatches,
+    parent_logger: &Logger,
+) -> Result<(), anyhow::Error> {
     let batch_ids: Vec<&str> = sub_matches
         .values_of("batch-id")
         .context("no batch-id")?
@@ -1468,19 +1529,23 @@ fn aggregate_subcommand(sub_matches: &ArgMatches) -> Result<(), anyhow::Error> {
         batch_info,
         sub_matches,
         None,
+        parent_logger,
         || {}, // no-op callback
     )
 }
 
-fn aggregate_worker(sub_matches: &ArgMatches) -> Result<(), anyhow::Error> {
-    let mut queue = aggregation_task_queue_from_args(sub_matches)?;
+fn aggregate_worker(sub_matches: &ArgMatches, parent_logger: &Logger) -> Result<(), anyhow::Error> {
+    let mut queue = aggregation_task_queue_from_args(sub_matches, parent_logger)?;
     let metrics_collector = AggregateMetricsCollector::new()?;
     let scrape_port = value_t!(sub_matches.value_of("metrics-scrape-port"), u16)?;
-    let _runtime = start_metrics_scrape_endpoint(scrape_port)?;
+    let _runtime = start_metrics_scrape_endpoint(scrape_port, parent_logger)?;
 
     loop {
         if let Some(task_handle) = queue.dequeue()? {
-            info!("dequeued task: {}", task_handle);
+            info!(
+                parent_logger, "dequeued task";
+                TASK_HANDLE_EVENT_KEY => format!("{}", task_handle)
+            );
             let task_start = Instant::now();
 
             let batches: Vec<(&str, &str)> = task_handle
@@ -1504,11 +1569,12 @@ fn aggregate_worker(sub_matches: &ArgMatches) -> Result<(), anyhow::Error> {
                 batches,
                 sub_matches,
                 Some(&metrics_collector),
+                parent_logger,
                 || {
                     if let Err(e) =
                         queue.maybe_extend_task_deadline(&task_handle, &task_start.elapsed())
                     {
-                        error!("{}", e);
+                        error!(parent_logger, "{}", e);
                     }
                 },
             );
@@ -1516,7 +1582,10 @@ fn aggregate_worker(sub_matches: &ArgMatches) -> Result<(), anyhow::Error> {
             match result {
                 Ok(_) => queue.acknowledge_task(task_handle)?,
                 Err(err) => {
-                    error!("error while processing task {}: {:?}", task_handle, err);
+                    error!(
+                        parent_logger, "error while processing task: {:?}", err;
+                        TASK_HANDLE_EVENT_KEY => format!("{}", task_handle)
+                    );
                     queue.nacknowledge_task(task_handle)?;
                 }
             }
@@ -1639,12 +1708,19 @@ fn batch_signing_key_from_arg(matches: &ArgMatches) -> Result<BatchSigningKey> {
     })
 }
 
-fn intake_transport_from_args(matches: &ArgMatches) -> Result<VerifiableAndDecryptableTransport> {
+fn intake_transport_from_args(
+    matches: &ArgMatches,
+    logger: &Logger,
+) -> Result<VerifiableAndDecryptableTransport> {
     // To read (intake) content from an ingestor's bucket, we need the bucket, which we
     // know because our deployment created it, so it is always provided via the
     // ingestor-input argument.
-    let intake_transport =
-        transport_from_args(Entity::Ingestor, PathOrInOut::InOut(InOut::Input), matches)?;
+    let intake_transport = transport_from_args(
+        Entity::Ingestor,
+        PathOrInOut::InOut(InOut::Input),
+        matches,
+        logger,
+    )?;
 
     // We also need the public keys the ingestor may have used to sign the
     // the batch, which can be provided either directly via command line or must
@@ -1707,6 +1783,7 @@ fn transport_from_args(
     entity: Entity,
     path_or_in_out: PathOrInOut,
     matches: &ArgMatches,
+    logger: &Logger,
 ) -> Result<Box<dyn Transport>> {
     let identity = matches.value_of(entity.suffix("-identity"));
 
@@ -1722,7 +1799,7 @@ fn transport_from_args(
         }
     };
 
-    transport_for_path(path, identity, entity, matches)
+    transport_for_path(path, identity, entity, matches, logger)
 }
 
 fn transport_for_path(
@@ -1730,6 +1807,7 @@ fn transport_for_path(
     identity: Identity,
     entity: Entity,
     matches: &ArgMatches,
+    logger: &Logger,
 ) -> Result<Box<dyn Transport>> {
     // We use the value "" to indicate that either ambient AWS credentials (for
     // S3) or the default service account Oauth token (for GCS) should be used
@@ -1757,13 +1835,19 @@ fn transport_for_path(
                     bool
                 )?,
                 "s3",
+                logger,
             )?;
-            Ok(Box::new(S3Transport::new(path, credentials_provider)))
+            Ok(Box::new(S3Transport::new(
+                path,
+                credentials_provider,
+                logger,
+            )))
         }
         StoragePath::GCSPath(path) => Ok(Box::new(GCSTransport::new(
             path,
             identity,
             key_file_reader,
+            logger,
         )?)),
         StoragePath::LocalPath(path) => Ok(Box::new(LocalFileTransport::new(path))),
     }
@@ -1788,6 +1872,7 @@ fn decode_base64_key(s: &str) -> Result<Vec<u8>> {
 // [1] https://doc.rust-lang.org/book/ch17-02-trait-objects.html#object-safety-is-required-for-trait-objects
 fn intake_task_queue_from_args(
     matches: &ArgMatches,
+    logger: &Logger,
 ) -> Result<Box<dyn TaskQueue<IntakeBatchTask>>> {
     let task_queue_kind = TaskQueueKind::from_str(
         matches
@@ -1810,6 +1895,7 @@ fn intake_task_queue_from_args(
                 gcp_project_id,
                 queue_name,
                 identity,
+                logger,
             )?))
         }
         TaskQueueKind::AwsSqs => {
@@ -1823,11 +1909,13 @@ fn intake_task_queue_from_args(
                     bool
                 )?,
                 "sqs",
+                logger,
             )?;
             Ok(Box::new(AwsSqsTaskQueue::new(
                 sqs_region,
                 queue_name,
                 credentials_provider,
+                logger,
             )?))
         }
     }
@@ -1835,6 +1923,7 @@ fn intake_task_queue_from_args(
 
 fn aggregation_task_queue_from_args(
     matches: &ArgMatches,
+    logger: &Logger,
 ) -> Result<Box<dyn TaskQueue<AggregationTask>>> {
     let task_queue_kind = TaskQueueKind::from_str(
         matches
@@ -1857,6 +1946,7 @@ fn aggregation_task_queue_from_args(
                 gcp_project_id,
                 queue_name,
                 identity,
+                logger,
             )?))
         }
         TaskQueueKind::AwsSqs => {
@@ -1870,11 +1960,13 @@ fn aggregation_task_queue_from_args(
                     bool
                 )?,
                 "sqs",
+                logger,
             )?;
             Ok(Box::new(AwsSqsTaskQueue::new(
                 sqs_region,
                 queue_name,
                 credentials_provider,
+                logger,
             )?))
         }
     }

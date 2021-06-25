@@ -516,9 +516,6 @@ output "singleton_ingestor" {
     batch_signing_key_name      = module.fake_server_resources[0].batch_signing_key_name
   } : {}
 }
-output "own_manifest_base_url" {
-  value = local.manifest.base_url
-}
 
 output "use_test_pha_decryption_key" {
   value = lookup(var.test_peer_environment, "env_without_ingestor", "") == var.environment

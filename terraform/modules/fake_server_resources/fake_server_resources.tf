@@ -6,10 +6,6 @@ variable "gcp_region" {
   type = string
 }
 
-variable "manifest_bucket" {
-  type = string
-}
-
 variable "own_manifest_base_url" {
   type = string
 }

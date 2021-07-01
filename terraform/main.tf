@@ -366,7 +366,7 @@ locals {
   # For now, we only support advertising manifests in GCS but in #655 we will
   # add support for S3
   manifest = {
-    bucket      = module.manifest.bucket
+    bucket_url  = module.manifest.bucket_url
     base_url    = module.manifest.base_url
     aws_region  = ""
     aws_profile = ""
@@ -449,7 +449,6 @@ resource "google_service_account_iam_binding" "data_share_processors_to_sum_part
 module "fake_server_resources" {
   count                 = local.is_env_with_ingestor ? 1 : 0
   source                = "./modules/fake_server_resources"
-  manifest_bucket       = module.manifest.bucket
   gcp_region            = var.gcp_region
   environment           = var.environment
   ingestor_pairs        = local.locality_ingestor_pairs
@@ -487,7 +486,7 @@ module "monitoring" {
 
 output "manifest_bucket" {
   value = {
-    bucket      = local.manifest.bucket
+    bucket_url  = local.manifest.bucket_url
     aws_region  = local.manifest.aws_region
     aws_profile = local.manifest.aws_profile
   }
@@ -515,9 +514,6 @@ output "singleton_ingestor" {
     tester_kubernetes_namespace = module.fake_server_resources[0].test_kubernetes_namespace
     batch_signing_key_name      = module.fake_server_resources[0].batch_signing_key_name
   } : {}
-}
-output "own_manifest_base_url" {
-  value = local.manifest.base_url
 }
 
 output "use_test_pha_decryption_key" {

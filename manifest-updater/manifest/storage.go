@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 
 	"cloud.google.com/go/storage"
 	"github.com/aws/aws-sdk-go/aws"
@@ -48,8 +49,9 @@ type Fetcher interface {
 
 // Bucket specifies the cloud storage bucket where manifests are stored
 type Bucket struct {
-	// Bucket is the name of the bucket, without any URL scheme
-	Bucket string `json:"bucket"`
+	// URL is the URL of the bucket, with the scheme "gs" for GCS buckets or
+	// "s3" for S3 buckets; e.g., "gs://bucket-name" or "s3://bucket-name"
+	URL string `json:"bucket_url"`
 	// AWSRegion is the region the bucket is in, if it is an S3 bucket
 	AWSRegion string `json:"aws_region,omitempty"`
 	// AWSProfile is the AWS CLI config profile that should be used to
@@ -60,10 +62,13 @@ type Bucket struct {
 // NewStorage creates an instance of the appropriate implementation of Writer for
 // the provided bucket
 func NewStorage(bucket *Bucket) (Storage, error) {
-	if bucket.AWSRegion != "" {
-		return newS3(bucket.Bucket, bucket.AWSRegion, bucket.AWSProfile)
+	if strings.HasPrefix(bucket.URL, "gs://") {
+		return newGCS(strings.TrimPrefix(bucket.URL, "gs://"))
+	} else if strings.HasPrefix(bucket.URL, "s3://") {
+		return newS3(strings.TrimPrefix(bucket.URL, "s3://"), bucket.AWSRegion, bucket.AWSProfile)
+	} else {
+		return nil, fmt.Errorf("bad bucket URL %s", bucket.URL)
 	}
-	return newGCS(bucket.Bucket)
 }
 
 // GCSStorage is a Storage that stores manifests in a Google Cloud Storage bucket
@@ -97,8 +102,13 @@ func (s *GCSStorage) writeManifest(manifest interface{}, path string) error {
 	ioWriter := s.getWriter(path)
 
 	if err := json.NewEncoder(ioWriter).Encode(manifest); err != nil {
-		_ = ioWriter.Close()
-		return fmt.Errorf("encoding manifest json failed: %w", err)
+		jsonErr := fmt.Errorf("encoding manifest to JSON failed: %w", err)
+
+		if closeErr := ioWriter.Close(); closeErr != nil {
+			return fmt.Errorf("failed to close manifest writer (with error: %s) while handling error: %w", closeErr, jsonErr)
+		}
+
+		return jsonErr
 	}
 
 	if err := ioWriter.Close(); err != nil {
@@ -126,7 +136,17 @@ func (s *GCSStorage) FetchDataShareProcessorSpecificManifest(dataShareProcessorN
 
 	var manifest DataShareProcessorSpecificManifest
 	if err := json.NewDecoder(reader).Decode(&manifest); err != nil {
-		return nil, fmt.Errorf("error parsing manifest: %w", err)
+		jsonErr := fmt.Errorf("error parsing manifest: %w", err)
+
+		if closeErr := reader.Close(); err != nil {
+			return nil, fmt.Errorf("failed to close manifest reader (with error: %s) while handling error: %w", closeErr, jsonErr)
+		}
+
+		return nil, jsonErr
+	}
+
+	if err := reader.Close(); err != nil {
+		return nil, fmt.Errorf("closing manifest reader failed: %w", err)
 	}
 
 	return &manifest, nil
@@ -140,7 +160,17 @@ func (s *GCSStorage) IngestorGlobalManifestExists() (bool, error) {
 
 	var manifest IngestorGlobalManifest
 	if err := json.NewDecoder(reader).Decode(&manifest); err != nil {
-		return false, fmt.Errorf("error parsing manifest: %w", err)
+		jsonErr := fmt.Errorf("error parsing manifest: %w", err)
+
+		if closeErr := reader.Close(); err != nil {
+			return false, fmt.Errorf("failed to close manifest reader (with error: %s) while handling error: %w", closeErr, jsonErr)
+		}
+
+		return false, jsonErr
+	}
+
+	if err := reader.Close(); err != nil {
+		return false, fmt.Errorf("failed to close manifest reader: %w", err)
 	}
 
 	return true, nil
@@ -225,7 +255,13 @@ func (s *S3Storage) FetchDataShareProcessorSpecificManifest(dataShareProcessorNa
 
 	var manifest DataShareProcessorSpecificManifest
 	if err := json.NewDecoder(reader).Decode(&manifest); err != nil {
-		return nil, fmt.Errorf("error parsing manifest: %w", err)
+		jsonErr := fmt.Errorf("error parsing manifest: %w", err)
+
+		if closeErr := reader.Close(); err != nil {
+			return nil, fmt.Errorf("failed to close manifest reader (with error: %s) while handling error: %w", closeErr, jsonErr)
+		}
+
+		return nil, jsonErr
 	}
 
 	return &manifest, nil
@@ -239,12 +275,24 @@ func (s *S3Storage) IngestorGlobalManifestExists() (bool, error) {
 
 	var manifest IngestorGlobalManifest
 	if err := json.NewDecoder(reader).Decode(&manifest); err != nil {
-		return false, fmt.Errorf("error parsing manifest: %w", err)
+		jsonErr := fmt.Errorf("error parsing manifest: %w", err)
+
+		if closeErr := reader.Close(); err != nil {
+			return false, fmt.Errorf("failed to close manifest reader (with error: %s) while handling error: %w", closeErr, jsonErr)
+		}
+
+		return false, jsonErr
+	}
+
+	if err := reader.Close(); err != nil {
+		return false, fmt.Errorf("failed to close manifest reader: %w", err)
 	}
 
 	return true, nil
 }
 
+// getReader returns an object from which the object's contents may be read.
+// the returned io.ReadCloser should be Close()d by the caller.
 func (s *S3Storage) getReader(path string) (io.ReadCloser, error) {
 	input := &s3.GetObjectInput{
 		Bucket: aws.String(s.manifestBucket),

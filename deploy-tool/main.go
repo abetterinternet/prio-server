@@ -408,7 +408,7 @@ func main() {
 
 	if terraformOutput.HasTestEnvironment.Value && terraformOutput.SingletonIngestor.Value != nil {
 		globalManifestStorage, err := manifest.NewStorage(&manifest.Bucket{
-			Bucket:     fmt.Sprintf("%s/singleton-ingestor", terraformOutput.ManifestBucket.Value.Bucket),
+			URL:        fmt.Sprintf("%s/singleton-ingestor", terraformOutput.ManifestBucket.Value.URL),
 			AWSRegion:  terraformOutput.ManifestBucket.Value.AWSRegion,
 			AWSProfile: terraformOutput.ManifestBucket.Value.AWSProfile,
 		})

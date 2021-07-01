@@ -127,6 +127,10 @@ resource "google_compute_global_forwarding_rule" "manifests" {
   target     = google_compute_target_https_proxy.manifests.id
 }
 
+output "bucket_url" {
+  value = "gs://${google_storage_bucket.manifests.name}"
+}
+
 output "bucket" {
   value = google_storage_bucket.manifests.name
 }

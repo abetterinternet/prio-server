@@ -94,9 +94,11 @@ impl WorkloadIdentityPoolParameters {
             Some(provider_id) => Some(Self {
                 workload_identity_pool_provider: provider_id.to_owned(),
                 aws_credentials_provider: aws_credentials::Provider::new(
-                    // We create this provider with no identity, effectively
-                    // requiring that the authentication to AWS use either
-                    // ambient AWS credentials or an EKS cluster OIDC provider.
+                    // We create this provider with no identity and no
+                    // impersonated GCP service account, requiring that the
+                    // authentication to AWS use either ambient AWS credentials
+                    // or an EKS cluster OIDC provider.
+                    Identity::none(),
                     Identity::none(),
                     use_default_aws_credentials_provider,
                     "IAM federation",

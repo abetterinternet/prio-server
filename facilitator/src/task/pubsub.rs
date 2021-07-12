@@ -160,7 +160,7 @@ impl<T: Task> GcpPubSubTaskQueue<T> {
 }
 
 impl<T: Task> TaskQueue<T> for GcpPubSubTaskQueue<T> {
-    fn dequeue(&mut self) -> Result<Option<TaskHandle<T>>> {
+    fn dequeue(&self) -> Result<Option<TaskHandle<T>>> {
         info!(self.logger, "pull task");
 
         let request = self.agent.prepare_request(RequestParameters {
@@ -220,7 +220,7 @@ impl<T: Task> TaskQueue<T> for GcpPubSubTaskQueue<T> {
         Ok(Some(handle))
     }
 
-    fn acknowledge_task(&mut self, handle: TaskHandle<T>) -> Result<()> {
+    fn acknowledge_task(&self, handle: TaskHandle<T>) -> Result<()> {
         let logger = self.logger.new(o!(
             event::TASK_ACKNOWLEDGEMENT_ID => handle.acknowledgment_id.to_owned(),
         ));
@@ -249,7 +249,7 @@ impl<T: Task> TaskQueue<T> for GcpPubSubTaskQueue<T> {
         Ok(())
     }
 
-    fn nacknowledge_task(&mut self, handle: TaskHandle<T>) -> Result<()> {
+    fn nacknowledge_task(&self, handle: TaskHandle<T>) -> Result<()> {
         info!(
             self.logger, "nacknowledging task";
             event::TASK_ACKNOWLEDGEMENT_ID => &handle.acknowledgment_id,
@@ -259,7 +259,7 @@ impl<T: Task> TaskQueue<T> for GcpPubSubTaskQueue<T> {
             .context("failed to nacknowledge task")
     }
 
-    fn extend_task_deadline(&mut self, handle: &TaskHandle<T>, increment: &Duration) -> Result<()> {
+    fn extend_task_deadline(&self, handle: &TaskHandle<T>, increment: &Duration) -> Result<()> {
         info!(
             self.logger, "extending deadline on task";
             event::TASK_ACKNOWLEDGEMENT_ID => &handle.acknowledgment_id,
@@ -273,11 +273,7 @@ impl<T: Task> TaskQueue<T> for GcpPubSubTaskQueue<T> {
 impl<T: Task> GcpPubSubTaskQueue<T> {
     /// Changes the ack deadline on the message described by the task handle,
     /// resetting it to the provided duration.
-    fn modify_ack_deadline(
-        &mut self,
-        handle: &TaskHandle<T>,
-        ack_deadline: &Duration,
-    ) -> Result<()> {
+    fn modify_ack_deadline(&self, handle: &TaskHandle<T>, ack_deadline: &Duration) -> Result<()> {
         let logger = self.logger.new(o!(
             event::TASK_ACKNOWLEDGEMENT_ID => handle.acknowledgment_id.to_owned(),
         ));
